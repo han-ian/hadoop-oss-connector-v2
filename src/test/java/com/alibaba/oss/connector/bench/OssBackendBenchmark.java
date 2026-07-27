@@ -1,313 +1,184 @@
 package com.alibaba.oss.connector.bench;
 
 import com.alibaba.oss.connector.*;
-import com.alibaba.oss.connector.models.ObjectSummary;
+
+import org.openjdk.jmh.annotations.*;
+import org.openjdk.jmh.infra.Blackhole;
+import org.openjdk.jmh.results.format.ResultFormatType;
+import org.openjdk.jmh.runner.Runner;
+import org.openjdk.jmh.runner.options.Options;
+import org.openjdk.jmh.runner.options.OptionsBuilder;
+import org.openjdk.jmh.runner.options.TimeValue;
 
 import java.io.InputStream;
-import java.util.Arrays;
-import java.util.List;
+import java.util.concurrent.TimeUnit;
 
 /**
- * Benchmark comparing JNI backend vs Java SDK backend.
+ * JMH Benchmark: JNI backend vs Java SDK backend for OSS operations.
  *
- * <p>Usage:
+ * <p>Config via system properties:
  * <pre>
- * java -Djava.library.path=/path/to/native \
- *      -cp target/hadoop-oss-3.3.5-2.0.26-alpha.jar:target/dependency/* \
- *      com.alibaba.oss.connector.bench.OssBackendBenchmark \
- *      --endpoint oss-cn-hangzhou-internal.aliyuncs.com \
- *      --bucket my-bucket \
- *      --key test-data/128mb.bin \
- *      --ak ACCESS_KEY_ID \
- *      --sk ACCESS_KEY_SECRET \
- *      --region cn-hangzhou
+ *   -Doss.endpoint=oss-cn-beijing-internal.aliyuncs.com
+ *   -Doss.bucket=hy-test-dadi-2026-bj
+ *   -Doss.key=bench-data/4mb.bin
+ *   -Doss.region=cn-beijing
+ *   -Doss.keyCount=20        (optional, anti-cache key rotation)
+ * </pre>
+ *
+ * <p>Run:
+ * <pre>
+ *   java -Djava.library.path=/path/to/native \
+ *        -Doss.endpoint=... -Doss.bucket=... -Doss.key=... \
+ *        -cp target/test-classes:target/classes:target/dependency/* \
+ *        com.alibaba.oss.connector.bench.OssBackendBenchmark
  * </pre>
  */
+@BenchmarkMode({Mode.AverageTime, Mode.Throughput})
+@OutputTimeUnit(TimeUnit.MILLISECONDS)
+@State(Scope.Thread)
+@Fork(value = 1, jvmArgsAppend = {
+        "-Djava.library.path=" + OssBackendBenchmark.NATIVE_LIB_HINT
+})
+@Warmup(iterations = 2, time = 3, timeUnit = TimeUnit.SECONDS)
+@Measurement(iterations = 3, time = 5, timeUnit = TimeUnit.SECONDS)
 public class OssBackendBenchmark {
 
-    // ── Config ──
+    static final String NATIVE_LIB_HINT = "/tmp/mini-sdk-bench/lib";
+
+    // ── Parametrized dimensions (JMH auto-generates all combinations) ──
+
+    @Param({"jni", "java"})
+    private String backend;
+
+    @Param({"4096", "65536", "1048576", "4194304"})
+    private String readSize;
+
+    // ── OSS config (from system properties) ──
 
     private String endpoint;
     private String bucket;
-    private String key;
+    private String region;
     private String accessKeyId;
     private String accessKeySecret;
-    private String region;
-    private String backendFilter = "all"; // "all", "jni", or "java"
+    private String[] keys;     // rotated key list (anti-cache)
+    private int keyIndex = 0;
 
-    // ── Benchmark parameters ──
+    // ── Backend ──
 
-    private static final int WARMUP_ITERATIONS = 5;
-    private static final int MEASURE_ITERATIONS = 20;
-    private static final long[] READ_SIZES = {4096, 65536, 1048576, 4194304}; // 4KB, 64KB, 1MB, 4MB
+    private OssBackend client;
+    private long readSizeLong;
+
+    @Setup(Level.Trial)
+    public void setup() {
+        endpoint = requireProp("oss.endpoint");
+        bucket   = requireProp("oss.bucket");
+        region   = System.getProperty("oss.region", "");
+
+        accessKeyId     = System.getenv("OSS_ACCESS_KEY_ID");
+        accessKeySecret = System.getenv("OSS_ACCESS_KEY_SECRET");
+        if (accessKeyId == null || accessKeySecret == null) {
+            throw new IllegalStateException("OSS_ACCESS_KEY_ID / OSS_ACCESS_KEY_SECRET not set");
+        }
+
+        // Key rotation: generate N keys from base key
+        String baseKey = requireProp("oss.key");
+        int keyCount = Integer.parseInt(System.getProperty("oss.keyCount", "1"));
+        keys = generateKeys(baseKey, keyCount);
+
+        readSizeLong = Long.parseLong(readSize);
+
+        // Create backend
+        switch (backend) {
+            case "jni":
+                client = new JniOssBackend(endpoint, null, null, null, region);
+                break;
+            case "java":
+                client = new JavaSdkOssBackend(endpoint, accessKeyId, accessKeySecret, region, bucket);
+                break;
+            default:
+                throw new IllegalArgumentException("Unknown backend: " + backend);
+        }
+    }
+
+    @TearDown(Level.Trial)
+    public void tearDown() throws Exception {
+        if (client != null) {
+            client.close();
+        }
+    }
+
+    // ── Benchmarks ──
+
+    @Benchmark
+    public long headObject(Blackhole bh) {
+        String k = nextKey();
+        long size = client.headObject(bucket, k);
+        bh.consume(size);
+        return size;
+    }
+
+    @Benchmark
+    public long getObject(Blackhole bh) {
+        String k = nextKey();
+        long totalRead = 0;
+        try (InputStream is = client.getObject(bucket, k, 0, readSizeLong)) {
+            byte[] buf = new byte[8192];
+            int n;
+            while ((n = is.read(buf)) > 0) {
+                totalRead += n;
+            }
+        } catch (Exception e) {
+            throw new RuntimeException("getObject failed: " + bucket + "/" + k, e);
+        }
+        bh.consume(totalRead);
+        return totalRead;
+    }
+
+    // ── Main (JMH runner) ──
 
     public static void main(String[] args) throws Exception {
-        OssBackendBenchmark bench = new OssBackendBenchmark();
-        bench.parseArgs(args);
-        bench.run();
-    }
-
-    private void parseArgs(String[] args) {
-        // AK/SK 默认从环境变量读取 (source dadi.env 后自动可用)
-        accessKeyId = System.getenv("OSS_ACCESS_KEY_ID");
-        accessKeySecret = System.getenv("OSS_ACCESS_KEY_SECRET");
-        for (int i = 0; i < args.length; i += 2) {
-            switch (args[i]) {
-                case "--endpoint": endpoint = args[i + 1]; break;
-                case "--bucket":   bucket = args[i + 1]; break;
-                case "--key":      key = args[i + 1]; break;
-                case "--ak":       accessKeyId = args[i + 1]; break;
-                case "--sk":       accessKeySecret = args[i + 1]; break;
-                case "--region":   region = args[i + 1]; break;
-                case "--backend":  backendFilter = args[i + 1]; break;
-            }
-        }
-        if (endpoint == null || bucket == null || key == null
-                || accessKeyId == null || accessKeySecret == null) {
-            System.err.println("Usage: OssBackendBenchmark --endpoint <ep> --bucket <b> --key <k> [--region <r>] [--backend all|jni|java]");
-            System.err.println("  AK/SK: 从环境变量 OSS_ACCESS_KEY_ID / OSS_ACCESS_KEY_SECRET 读取, 或用 --ak/--sk 覆盖");
-            System.exit(1);
-        }
-    }
-
-    private void run() throws Exception {
-        System.out.println("╔════════════════════════════════════════════════════════════╗");
-        System.out.println("║     OSS Backend Benchmark: JNI vs Java SDK               ║");
-        System.out.println("╚════════════════════════════════════════════════════════════╝");
-        System.out.printf("Endpoint: %s%n", endpoint);
-        System.out.printf("Bucket:   %s%n", bucket);
-        System.out.printf("Key:      %s%n", key);
-        System.out.printf("Warmup:   %d iterations%n", WARMUP_ITERATIONS);
-        System.out.printf("Measure:  %d iterations%n", MEASURE_ITERATIONS);
-        System.out.printf("Backend:  %s%n", backendFilter);
-        System.out.println();
-
-        // ── Test 1: headObject ──
-        benchHeadObject();
-
-        // ── Test 2: getObject (various sizes) ──
-        for (long size : READ_SIZES) {
-            benchGetObject(size);
-        }
-
-        // ── Test 3: listObjects ──
-        benchListObjects();
-
-        // ── Test 4: multi-threaded getObject ──
-        benchMultiThreaded(4);
-        benchMultiThreaded(8);
-        benchMultiThreaded(16);
-
-        System.out.println();
-        System.out.println("Benchmark complete.");
-    }
-
-    // ── headObject benchmark ──
-
-    private void benchHeadObject() throws Exception {
-        System.out.println("── headObject ──");
-        printHeader();
-
-        for (String backendType : backends()) {
-            try (OssBackend backend = createBackend(backendType)) {
-                // warmup
-                for (int i = 0; i < WARMUP_ITERATIONS; i++) {
-                    backend.headObject(bucket, key);
-                }
-                // measure
-                long[] latencies = new long[MEASURE_ITERATIONS];
-                for (int i = 0; i < MEASURE_ITERATIONS; i++) {
-                    long start = System.nanoTime();
-                    long size = backend.headObject(bucket, key);
-                    latencies[i] = System.nanoTime() - start;
-                    if (i == 0) {
-                        System.out.printf("  [%s] content-length = %d bytes%n", backend.backendName(), size);
-                    }
-                }
-                printStats(backend.backendName(), latencies);
-            }
-        }
-        System.out.println();
-    }
-
-    // ── getObject benchmark ──
-
-    private void benchGetObject(long readSize) throws Exception {
-        System.out.printf("── getObject (range size = %s) ──%n", formatSize(readSize));
-        printHeader();
-
-        for (String backendType : backends()) {
-            try (OssBackend backend = createBackend(backendType)) {
-                // warmup
-                for (int i = 0; i < WARMUP_ITERATIONS; i++) {
-                    readAndDiscard(backend.getObject(bucket, key, 0, readSize));
-                }
-                // measure
-                long[] latencies = new long[MEASURE_ITERATIONS];
-                long[] bytesRead = new long[MEASURE_ITERATIONS];
-                for (int i = 0; i < MEASURE_ITERATIONS; i++) {
-                    long start = System.nanoTime();
-                    try (InputStream is = backend.getObject(bucket, key, 0, readSize)) {
-                        bytesRead[i] = readAndDiscard(is);
-                    }
-                    latencies[i] = System.nanoTime() - start;
-                }
-                printStatsWithThroughput(backend.backendName(), latencies, readSize);
-            }
-        }
-        System.out.println();
-    }
-
-    // ── listObjects benchmark ──
-
-    private void benchListObjects() throws Exception {
-        System.out.println("── listObjects ──");
-        printHeader();
-
-        for (String backendType : backends()) {
-            try (OssBackend backend = createBackend(backendType)) {
-                String prefix = key.contains("/") ? key.substring(0, key.lastIndexOf('/') + 1) : "";
-
-                // warmup
-                for (int i = 0; i < WARMUP_ITERATIONS; i++) {
-                    List<ObjectSummary> contents = backend.listObjects(bucket, prefix);
-                }
-                // measure
-                long[] latencies = new long[MEASURE_ITERATIONS];
-                int keyCount = 0;
-                for (int i = 0; i < MEASURE_ITERATIONS; i++) {
-                    long start = System.nanoTime();
-                    List<ObjectSummary> contents = backend.listObjects(bucket, prefix);
-                    keyCount = contents.size();
-                    latencies[i] = System.nanoTime() - start;
-                }
-                printStats(backend.backendName(), latencies);
-                System.out.printf("  [%s] listed %d keys%n", backend.backendName(), keyCount);
-            }
-        }
-        System.out.println();
-    }
-
-    // ── multi-threaded getObject ──
-
-    private void benchMultiThreaded(int threadCount) throws Exception {
-        System.out.printf("── multi-threaded getObject (%d threads, 1MB each) ──%n", threadCount);
-        printHeader();
-
-        for (String backendType : backends()) {
-            try (OssBackend backend = createBackend(backendType)) {
-                final long readSize = 1048576; // 1MB
-                final int itersPerThread = MEASURE_ITERATIONS / threadCount;
-
-                // warmup
-                Thread[] warmThreads = new Thread[threadCount];
-                for (int t = 0; t < threadCount; t++) {
-                    warmThreads[t] = new Thread(() -> {
-                        for (int i = 0; i < WARMUP_ITERATIONS; i++) {
-                            readAndDiscard(backend.getObject(bucket, key, 0, readSize));
-                        }
-                    });
-                    warmThreads[t].start();
-                }
-                for (Thread th : warmThreads) th.join();
-
-                // measure
-                long[] threadLatencies = new long[threadCount];
-                long wallStart = System.nanoTime();
-                Thread[] threads = new Thread[threadCount];
-                for (int t = 0; t < threadCount; t++) {
-                    final int tid = t;
-                    threads[t] = new Thread(() -> {
-                        long minLat = Long.MAX_VALUE;
-                        for (int i = 0; i < itersPerThread; i++) {
-                            long start = System.nanoTime();
-                            readAndDiscard(backend.getObject(bucket, key, 0, readSize));
-                            long lat = System.nanoTime() - start;
-                            minLat = Math.min(minLat, lat);
-                        }
-                        threadLatencies[tid] = minLat;
-                    });
-                    threads[t].start();
-                }
-                for (Thread th : threads) th.join();
-                long wallTime = System.nanoTime() - wallStart;
-
-                double totalMB = (double) readSize * threadCount * itersPerThread / 1048576;
-                double wallSec = wallTime / 1e9;
-                double throughput = totalMB / wallSec;
-
-                System.out.printf("  [%s] wall=%.2fs, throughput=%.1f MB/s, min_latency=%.1f ms%n",
-                        backend.backendName(), wallSec, throughput,
-                        Arrays.stream(threadLatencies).min().orElse(0) / 1e6);
-            }
-        }
-        System.out.println();
+        String resultFile = System.getProperty("oss.resultFile", "/tmp/jmh-result.json");
+        Options opt = new OptionsBuilder()
+                .include(OssBackendBenchmark.class.getSimpleName())
+                .resultFormat(ResultFormatType.JSON)
+                .result(resultFile)
+                .build();
+        new Runner(opt).run();
     }
 
     // ── Helpers ──
 
-    private String[] backends() {
-        switch (backendFilter) {
-            case "jni":  return new String[]{"jni"};
-            case "java": return new String[]{"java"};
-            default:     return new String[]{"jni", "java"};
+    private String nextKey() {
+        String k = keys[keyIndex % keys.length];
+        keyIndex++;
+        return k;
+    }
+
+    private static String requireProp(String name) {
+        String v = System.getProperty(name);
+        if (v == null || v.isEmpty()) {
+            throw new IllegalStateException("Required system property: -D" + name + "=...");
         }
+        return v;
     }
 
-    private OssBackend createBackend(String type) {
-        switch (type) {
-            case "jni":
-                return new JniOssBackend(endpoint, null, null, null, region);
-            case "java":
-                return new JavaSdkOssBackend(endpoint, accessKeyId, accessKeySecret, region, bucket);
-            default:
-                throw new IllegalArgumentException("Unknown backend: " + type);
+    /**
+     * Generate N keys from a base key by inserting _N before the extension.
+     * e.g. bench-data/4mb.bin → bench-data/4mb_0.bin, bench-data/4mb_1.bin, ...
+     * If keyCount == 1, return the original key unchanged.
+     */
+    static String[] generateKeys(String baseKey, int count) {
+        String[] result = new String[count];
+        if (count == 1) {
+            result[0] = baseKey;
+            return result;
         }
-    }
-
-    private long readAndDiscard(InputStream is) {
-        try {
-            byte[] buf = new byte[8192];
-            long total = 0;
-            int n;
-            while ((n = is.read(buf)) > 0) {
-                total += n;
-            }
-            return total;
-        } catch (Exception e) {
-            throw new RuntimeException(e);
+        int dot = baseKey.lastIndexOf('.');
+        String prefix = dot > 0 ? baseKey.substring(0, dot) : baseKey;
+        String suffix = dot > 0 ? baseKey.substring(dot) : "";
+        for (int i = 0; i < count; i++) {
+            result[i] = prefix + "_" + i + suffix;
         }
-    }
-
-    private void printHeader() {
-        System.out.printf("  %-35s %10s %10s %10s %10s%n",
-                "Backend", "P50(ms)", "P99(ms)", "Min(ms)", "Max(ms)");
-        System.out.printf("  %-35s %10s %10s %10s %10s%n",
-                "───────", "───────", "───────", "───────", "───────");
-    }
-
-    private void printStats(String name, long[] latenciesNanos) {
-        Arrays.sort(latenciesNanos);
-        int n = latenciesNanos.length;
-        double p50 = latenciesNanos[n / 2] / 1e6;
-        double p99 = latenciesNanos[(int)(n * 0.99)] / 1e6;
-        double min = latenciesNanos[0] / 1e6;
-        double max = latenciesNanos[n - 1] / 1e6;
-        System.out.printf("  %-35s %10.2f %10.2f %10.2f %10.2f%n",
-                name, p50, p99, min, max);
-    }
-
-    private void printStatsWithThroughput(String name, long[] latenciesNanos, long readSize) {
-        printStats(name, latenciesNanos);
-        Arrays.sort(latenciesNanos);
-        double avgSec = Arrays.stream(latenciesNanos).average().orElse(1) / 1e9;
-        double mbps = (readSize / 1048576.0) / avgSec;
-        System.out.printf("  %-35s avg throughput: %.1f MB/s%n", name, mbps);
-    }
-
-    private String formatSize(long bytes) {
-        if (bytes >= 1048576) return (bytes / 1048576) + "MB";
-        if (bytes >= 1024) return (bytes / 1024) + "KB";
-        return bytes + "B";
+        return result;
     }
 }
