@@ -4,13 +4,17 @@ import com.alibaba.oss.connector.*;
 
 import org.openjdk.jmh.annotations.*;
 import org.openjdk.jmh.infra.Blackhole;
+import org.openjdk.jmh.profile.GCProfiler;
 import org.openjdk.jmh.results.format.ResultFormatType;
 import org.openjdk.jmh.runner.Runner;
 import org.openjdk.jmh.runner.options.Options;
 import org.openjdk.jmh.runner.options.OptionsBuilder;
 import org.openjdk.jmh.runner.options.TimeValue;
 
+import com.sun.management.OperatingSystemMXBean;
+
 import java.io.InputStream;
+import java.lang.management.ManagementFactory;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -68,6 +72,12 @@ public class OssBackendBenchmark {
     private OssBackend client;
     private long readSizeLong;
 
+    // ── Resource tracking (CPU / heap) ──
+
+    private OperatingSystemMXBean osMxBean;
+    private long cpuTimeStartNs;
+    private long heapUsedStart;
+
     @Setup(Level.Trial)
     public void setup() {
         endpoint = requireProp("oss.endpoint");
@@ -98,10 +108,26 @@ public class OssBackendBenchmark {
             default:
                 throw new IllegalArgumentException("Unknown backend: " + backend);
         }
+
+        // Snapshot CPU & heap before benchmark
+        osMxBean = ManagementFactory.getPlatformMXBean(OperatingSystemMXBean.class);
+        System.gc();
+        heapUsedStart = Runtime.getRuntime().totalMemory() - Runtime.getRuntime().freeMemory();
+        cpuTimeStartNs = osMxBean.getProcessCpuTime();
+        System.err.printf("[resource] trial start: heap=%.1fMB, cpuTime=%.1fms, backend=%s, readSize=%s%n",
+                heapUsedStart / 1048576.0, cpuTimeStartNs / 1e6, backend, readSize);
     }
 
     @TearDown(Level.Trial)
     public void tearDown() throws Exception {
+        // Snapshot CPU & heap after benchmark
+        long cpuTimeEndNs = osMxBean.getProcessCpuTime();
+        long heapUsedEnd = Runtime.getRuntime().totalMemory() - Runtime.getRuntime().freeMemory();
+        double cpuMs = (cpuTimeEndNs - cpuTimeStartNs) / 1e6;
+        double heapDeltaMB = (heapUsedEnd - heapUsedStart) / 1048576.0;
+        System.err.printf("[resource] trial end: cpuDelta=%.1fms, heapDelta=%.1fMB, heapFinal=%.1fMB, backend=%s, readSize=%s%n",
+                cpuMs, heapDeltaMB, heapUsedEnd / 1048576.0, backend, readSize);
+
         if (client != null) {
             client.close();
         }
@@ -140,6 +166,7 @@ public class OssBackendBenchmark {
         String resultFile = System.getProperty("oss.resultFile", "/tmp/jmh-result.json");
         Options opt = new OptionsBuilder()
                 .include(OssBackendBenchmark.class.getSimpleName())
+                .addProfiler(GCProfiler.class)
                 .resultFormat(ResultFormatType.JSON)
                 .result(resultFile)
                 .build();
