@@ -110,6 +110,12 @@
                 <configuration>
                     <source>${maven.compiler.source}</source>
                     <target>${maven.compiler.target}</target>
+                    <!-- Exclude credentials providers with missing AbstractReflectiveCredentialsProvider -->
+                    <excludes>
+                        <exclude>**/credentials/ECSRAMRoleCredentialsProvider.java</exclude>
+                        <exclude>**/credentials/OIDCRoleARNCredentialsProvider.java</exclude>
+                        <exclude>**/credentials/RAMRoleARNCredentialsProvider.java</exclude>
+                    </excludes>
                 </configuration>
             </plugin>
             <plugin>
