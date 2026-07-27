@@ -299,6 +299,51 @@ Rules explanation:
 5. Operation matching (operations):
     - Supports getObject operations only for now
 
+## JNI Backend (oss-mini-sdk)
+
+The `com.alibaba.oss.connector` package provides a JNI-based OSS client that can replace the standard Java SDK for improved performance. The Java bindings in this package are **declaration-only** — the actual native library is built from a separate project.
+
+```
+┌─────────────────────────────────────────────────────────┐
+│  hadoop-oss-connector-v2.mini-sdk  (this project)       │
+│                                                         │
+│  Java bindings (declaration only):                      │
+│    OssClient, NativeBinding, OssObject, ...             │
+│    OssBackend, JniOssBackend, JavaSdkOssBackend        │
+│    OssBackendBenchmark                                  │
+└──────────────────────┬──────────────────────────────────┘
+                       │ runtime: System.loadLibrary("oss_connector_jni")
+                       ▼
+┌─────────────────────────────────────────────────────────┐
+│  dadi-connector.lib  (separate project)                 │
+│                                                         │
+│  Native implementation:                                 │
+│    oss_connector_jni.cpp  (JNI bridge)                  │
+│    oss_connector_api.h   (C ABI: ossc_* functions)      │
+│    → liboss_connector_jni.so                            │
+└─────────────────────────────────────────────────────────┘
+```
+
+### Build the native library
+
+```bash
+cd /path/to/dadi-connector.lib
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j$(nproc)
+# liboss_connector_jni.so will be in build/lib/
+```
+
+### Run with JNI backend
+
+```bash
+java -Djava.library.path=/path/to/dadi-connector.lib/build/lib \
+     -cp target/classes:target/dependency/* \
+     com.alibaba.oss.connector.bench.OssBackendBenchmark \
+     --endpoint oss-cn-hangzhou-internal.aliyuncs.com \
+     --bucket my-bucket --key test-data/128mb.bin \
+     --ak AK_ID --sk AK_SECRET --region cn-hangzhou
+```
+
 ## Development
 
 ### Project Structure
@@ -308,16 +353,23 @@ hadoop-oss/
 ├── src/
 │   ├── main/
 │   │   ├── java/
+│   │   │   ├── com/alibaba/oss/connector/
+│   │   │   │   ├── OssClient.java         # JNI client (declaration only)
+│   │   │   │   ├── NativeBinding.java     # JNI native methods (impl in dadi-connector.lib)
+│   │   │   │   ├── OssBackend.java        # Abstraction for swap
+│   │   │   │   ├── JniOssBackend.java     # JNI implementation
+│   │   │   │   ├── JavaSdkOssBackend.java # Java SDK implementation
+│   │   │   │   └── models/                # Data models
 │   │   │   └── org/apache/hadoop/fs/aliyun/oss/v2/
 │   │   │       ├── AliyunOSSFileSystemStore.java
 │   │   │       ├── AliyunOSSPerformanceFileSystem.java
-│   │   │       ├── Constants.java
 │   │   │       ├── OssManager.java
-│   │   │       └── model/
+│   │   │       └── ...
 │   │   └── resources/
 │   └── test/
-│       ├── java/
-│       └── resources/
+│       └── java/
+│           └── com/alibaba/oss/connector/bench/
+│               └── OssBackendBenchmark.java  # JNI vs Java SDK benchmark
 ├── pom.xml
 └── README.md
 ```

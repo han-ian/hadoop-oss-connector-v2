@@ -2,6 +2,20 @@ package com.alibaba.oss.connector;
 
 /**
  * Package-private JNI native method declarations.
+ *
+ * <p>This class only declares the native method signatures. The actual JNI
+ * implementation ({@code oss_connector_jni.cpp}) and the native library
+ * ({@code liboss_connector_jni.so}) are built and maintained in the
+ * <b>dadi-connector.lib</b> project:
+ * <pre>
+ *   codes.ali2/dadi-connector.lib/
+ *     src/torchconnector/cpplib/
+ *       api/oss_connector_api.h        -- C ABI (ossc_* functions)
+ *       bindings/java/jni/oss_connector_jni.cpp -- JNI bridge
+ * </pre>
+ *
+ * Runtime dependency: {@code -Djava.library.path=/path/to/dadi-connector.lib/build/lib}
+ *
  * All native pointers are passed as long (cast from C pointer types).
  */
 class NativeBinding {
