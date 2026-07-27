@@ -33,6 +33,7 @@ public class OssBackendBenchmark {
     private String accessKeyId;
     private String accessKeySecret;
     private String region;
+    private String backendFilter = "all"; // "all", "jni", or "java"
 
     // ── Benchmark parameters ──
 
@@ -55,10 +56,11 @@ public class OssBackendBenchmark {
                 case "--ak":       accessKeyId = args[i + 1]; break;
                 case "--sk":       accessKeySecret = args[i + 1]; break;
                 case "--region":   region = args[i + 1]; break;
+                case "--backend":  backendFilter = args[i + 1]; break;
             }
         }
         if (endpoint == null || bucket == null || key == null) {
-            System.err.println("Usage: OssBackendBenchmark --endpoint <ep> --bucket <b> --key <k> --ak <ak> --sk <sk> [--region <r>]");
+            System.err.println("Usage: OssBackendBenchmark --endpoint <ep> --bucket <b> --key <k> --ak <ak> --sk <sk> [--region <r>] [--backend all|jni|java]");
             System.exit(1);
         }
     }
@@ -72,6 +74,7 @@ public class OssBackendBenchmark {
         System.out.printf("Key:      %s%n", key);
         System.out.printf("Warmup:   %d iterations%n", WARMUP_ITERATIONS);
         System.out.printf("Measure:  %d iterations%n", MEASURE_ITERATIONS);
+        System.out.printf("Backend:  %s%n", backendFilter);
         System.out.println();
 
         // ── Test 1: headObject ──
@@ -100,7 +103,7 @@ public class OssBackendBenchmark {
         System.out.println("── headObject ──");
         printHeader();
 
-        for (String backendType : new String[]{"jni", "java"}) {
+        for (String backendType : backends()) {
             try (OssBackend backend = createBackend(backendType)) {
                 // warmup
                 for (int i = 0; i < WARMUP_ITERATIONS; i++) {
@@ -128,7 +131,7 @@ public class OssBackendBenchmark {
         System.out.printf("── getObject (range size = %s) ──%n", formatSize(readSize));
         printHeader();
 
-        for (String backendType : new String[]{"jni", "java"}) {
+        for (String backendType : backends()) {
             try (OssBackend backend = createBackend(backendType)) {
                 // warmup
                 for (int i = 0; i < WARMUP_ITERATIONS; i++) {
@@ -156,7 +159,7 @@ public class OssBackendBenchmark {
         System.out.println("── listObjects ──");
         printHeader();
 
-        for (String backendType : new String[]{"jni", "java"}) {
+        for (String backendType : backends()) {
             try (OssBackend backend = createBackend(backendType)) {
                 String prefix = key.contains("/") ? key.substring(0, key.lastIndexOf('/') + 1) : "";
 
@@ -186,7 +189,7 @@ public class OssBackendBenchmark {
         System.out.printf("── multi-threaded getObject (%d threads, 1MB each) ──%n", threadCount);
         printHeader();
 
-        for (String backendType : new String[]{"jni", "java"}) {
+        for (String backendType : backends()) {
             try (OssBackend backend = createBackend(backendType)) {
                 final long readSize = 1048576; // 1MB
                 final int itersPerThread = MEASURE_ITERATIONS / threadCount;
@@ -237,6 +240,14 @@ public class OssBackendBenchmark {
     }
 
     // ── Helpers ──
+
+    private String[] backends() {
+        switch (backendFilter) {
+            case "jni":  return new String[]{"jni"};
+            case "java": return new String[]{"java"};
+            default:     return new String[]{"jni", "java"};
+        }
+    }
 
     private OssBackend createBackend(String type) {
         switch (type) {
