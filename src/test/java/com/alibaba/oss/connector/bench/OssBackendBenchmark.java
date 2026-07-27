@@ -9,7 +9,6 @@ import org.openjdk.jmh.results.format.ResultFormatType;
 import org.openjdk.jmh.runner.Runner;
 import org.openjdk.jmh.runner.options.Options;
 import org.openjdk.jmh.runner.options.OptionsBuilder;
-import org.openjdk.jmh.runner.options.TimeValue;
 
 import com.sun.management.OperatingSystemMXBean;
 
@@ -20,21 +19,16 @@ import java.util.concurrent.TimeUnit;
 /**
  * JMH Benchmark: JNI backend vs Java SDK backend for OSS operations.
  *
+ * <p>Tests multiple file sizes: 64KB, 1MB, 4MB, 32MB, 64MB, 128MB, 512MB.
+ * Each size has N copies on OSS (anti-cache key rotation).
+ *
  * <p>Config via system properties:
  * <pre>
  *   -Doss.endpoint=oss-cn-beijing-internal.aliyuncs.com
  *   -Doss.bucket=hy-test-dadi-2026-bj
- *   -Doss.key=bench-data/4mb.bin
+ *   -Doss.keyPrefix=bench-data      (default)
  *   -Doss.region=cn-beijing
- *   -Doss.keyCount=20        (optional, anti-cache key rotation)
- * </pre>
- *
- * <p>Run:
- * <pre>
- *   java -Djava.library.path=/path/to/native \
- *        -Doss.endpoint=... -Doss.bucket=... -Doss.key=... \
- *        -cp target/test-classes:target/classes:target/dependency/* \
- *        com.alibaba.oss.connector.bench.OssBackendBenchmark
+ *   -Doss.keyCount=10               (anti-cache copies per size)
  * </pre>
  */
 @BenchmarkMode({Mode.AverageTime, Mode.Throughput})
@@ -49,30 +43,43 @@ public class OssBackendBenchmark {
 
     static final String NATIVE_LIB_HINT = "/tmp/mini-sdk-bench/lib";
 
-    // ── Parametrized dimensions (JMH auto-generates all combinations) ──
+    // ── File size labels → byte sizes ──
+
+    private static final long[][] SIZE_TABLE = {
+        // {bytes,   label_hash}  — label used in key construction
+        {64 * 1024,            0},  // 64kb
+        {1024 * 1024,          1},  // 1mb
+        {4 * 1024 * 1024,      2},  // 4mb
+        {32 * 1024 * 1024,     3},  // 32mb
+        {64 * 1024 * 1024,     4},  // 64mb
+        {128 * 1024 * 1024,    5},  // 128mb
+        {512 * 1024 * 1024,    6},  // 512mb
+    };
+
+    // ── Parametrized dimensions ──
 
     @Param({"jni", "java"})
     private String backend;
 
-    @Param({"4096", "65536", "1048576", "4194304"})
-    private String readSize;
+    @Param({"64kb", "1mb", "4mb", "32mb", "64mb", "128mb", "512mb"})
+    private String fileSize;
 
-    // ── OSS config (from system properties) ──
+    // ── OSS config ──
 
     private String endpoint;
     private String bucket;
     private String region;
     private String accessKeyId;
     private String accessKeySecret;
-    private String[] keys;     // rotated key list (anti-cache)
+    private String[] keys;
     private int keyIndex = 0;
 
     // ── Backend ──
 
     private OssBackend client;
-    private long readSizeLong;
+    private long fileSizeBytes;
 
-    // ── Resource tracking (CPU / heap) ──
+    // ── Resource tracking ──
 
     private OperatingSystemMXBean osMxBean;
     private long cpuTimeStartNs;
@@ -90,12 +97,13 @@ public class OssBackendBenchmark {
             throw new IllegalStateException("OSS_ACCESS_KEY_ID / OSS_ACCESS_KEY_SECRET not set");
         }
 
-        // Key rotation: generate N keys from base key
-        String baseKey = requireProp("oss.key");
-        int keyCount = Integer.parseInt(System.getProperty("oss.keyCount", "1"));
-        keys = generateKeys(baseKey, keyCount);
+        // Parse file size
+        fileSizeBytes = parseSize(fileSize);
 
-        readSizeLong = Long.parseLong(readSize);
+        // Key rotation: bench-data/{fileSize}_{i}.bin
+        String keyPrefix = System.getProperty("oss.keyPrefix", "bench-data");
+        int keyCount = Integer.parseInt(System.getProperty("oss.keyCount", "1"));
+        keys = generateKeys(keyPrefix, fileSize, keyCount);
 
         // Create backend
         switch (backend) {
@@ -114,19 +122,18 @@ public class OssBackendBenchmark {
         System.gc();
         heapUsedStart = Runtime.getRuntime().totalMemory() - Runtime.getRuntime().freeMemory();
         cpuTimeStartNs = osMxBean.getProcessCpuTime();
-        System.err.printf("[resource] trial start: heap=%.1fMB, cpuTime=%.1fms, backend=%s, readSize=%s%n",
-                heapUsedStart / 1048576.0, cpuTimeStartNs / 1e6, backend, readSize);
+        System.err.printf("[resource] trial start: heap=%.1fMB, cpuTime=%.1fms, backend=%s, fileSize=%s%n",
+                heapUsedStart / 1048576.0, cpuTimeStartNs / 1e6, backend, fileSize);
     }
 
     @TearDown(Level.Trial)
     public void tearDown() throws Exception {
-        // Snapshot CPU & heap after benchmark
         long cpuTimeEndNs = osMxBean.getProcessCpuTime();
         long heapUsedEnd = Runtime.getRuntime().totalMemory() - Runtime.getRuntime().freeMemory();
         double cpuMs = (cpuTimeEndNs - cpuTimeStartNs) / 1e6;
         double heapDeltaMB = (heapUsedEnd - heapUsedStart) / 1048576.0;
-        System.err.printf("[resource] trial end: cpuDelta=%.1fms, heapDelta=%.1fMB, heapFinal=%.1fMB, backend=%s, readSize=%s%n",
-                cpuMs, heapDeltaMB, heapUsedEnd / 1048576.0, backend, readSize);
+        System.err.printf("[resource] trial end: cpuDelta=%.1fms, heapDelta=%.1fMB, heapFinal=%.1fMB, backend=%s, fileSize=%s%n",
+                cpuMs, heapDeltaMB, heapUsedEnd / 1048576.0, backend, fileSize);
 
         if (client != null) {
             client.close();
@@ -147,8 +154,8 @@ public class OssBackendBenchmark {
     public long getObject(Blackhole bh) {
         String k = nextKey();
         long totalRead = 0;
-        try (InputStream is = client.getObject(bucket, k, 0, readSizeLong)) {
-            byte[] buf = new byte[8192];
+        try (InputStream is = client.getObject(bucket, k, 0, fileSizeBytes)) {
+            byte[] buf = new byte[65536];  // 64KB read buffer
             int n;
             while ((n = is.read(buf)) > 0) {
                 totalRead += n;
@@ -190,21 +197,35 @@ public class OssBackendBenchmark {
     }
 
     /**
-     * Generate N keys from a base key by inserting _N before the extension.
-     * e.g. bench-data/4mb.bin → bench-data/4mb_0.bin, bench-data/4mb_1.bin, ...
-     * If keyCount == 1, return the original key unchanged.
+     * Parse human-readable size label to bytes.
      */
-    static String[] generateKeys(String baseKey, int count) {
+    static long parseSize(String label) {
+        switch (label) {
+            case "64kb":  return 64L * 1024;
+            case "1mb":   return 1L * 1024 * 1024;
+            case "4mb":   return 4L * 1024 * 1024;
+            case "32mb":  return 32L * 1024 * 1024;
+            case "64mb":  return 64L * 1024 * 1024;
+            case "128mb": return 128L * 1024 * 1024;
+            case "512mb": return 512L * 1024 * 1024;
+            default:
+                throw new IllegalArgumentException("Unknown fileSize: " + label);
+        }
+    }
+
+    /**
+     * Generate N keys for a given file size.
+     * e.g. bench-data/4mb_0.bin, bench-data/4mb_1.bin, ...
+     * If keyCount == 1, return bench-data/4mb.bin
+     */
+    static String[] generateKeys(String prefix, String sizeLabel, int count) {
         String[] result = new String[count];
         if (count == 1) {
-            result[0] = baseKey;
+            result[0] = prefix + "/" + sizeLabel + ".bin";
             return result;
         }
-        int dot = baseKey.lastIndexOf('.');
-        String prefix = dot > 0 ? baseKey.substring(0, dot) : baseKey;
-        String suffix = dot > 0 ? baseKey.substring(dot) : "";
         for (int i = 0; i < count; i++) {
-            result[i] = prefix + "_" + i + suffix;
+            result[i] = prefix + "/" + sizeLabel + "_" + i + ".bin";
         }
         return result;
     }
