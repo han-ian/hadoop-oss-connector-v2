@@ -48,6 +48,9 @@ public class OssBackendBenchmark {
     }
 
     private void parseArgs(String[] args) {
+        // AK/SK 默认从环境变量读取 (source dadi.env 后自动可用)
+        accessKeyId = System.getenv("OSS_ACCESS_KEY_ID");
+        accessKeySecret = System.getenv("OSS_ACCESS_KEY_SECRET");
         for (int i = 0; i < args.length; i += 2) {
             switch (args[i]) {
                 case "--endpoint": endpoint = args[i + 1]; break;
@@ -59,8 +62,10 @@ public class OssBackendBenchmark {
                 case "--backend":  backendFilter = args[i + 1]; break;
             }
         }
-        if (endpoint == null || bucket == null || key == null) {
-            System.err.println("Usage: OssBackendBenchmark --endpoint <ep> --bucket <b> --key <k> --ak <ak> --sk <sk> [--region <r>] [--backend all|jni|java]");
+        if (endpoint == null || bucket == null || key == null
+                || accessKeyId == null || accessKeySecret == null) {
+            System.err.println("Usage: OssBackendBenchmark --endpoint <ep> --bucket <b> --key <k> [--region <r>] [--backend all|jni|java]");
+            System.err.println("  AK/SK: 从环境变量 OSS_ACCESS_KEY_ID / OSS_ACCESS_KEY_SECRET 读取, 或用 --ak/--sk 覆盖");
             System.exit(1);
         }
     }
