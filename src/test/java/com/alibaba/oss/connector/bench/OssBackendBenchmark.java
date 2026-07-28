@@ -150,18 +150,54 @@ public class OssBackendBenchmark {
         return size;
     }
 
+    /**
+     * Measures the getObject() call only — what the backend does internally.
+     *
+     * <p>Semantics differ by backend:
+     * <ul>
+     *   <li>JNI eager: native HTTP fetch + full data loaded into byte[] (entire file in memory)</li>
+     *   <li>Java SDK: HTTP connection established, returns streaming InputStream (no data read yet)</li>
+     * </ul>
+     *
+     * <p>For JNI this measures "fetch entire file"; for Java SDK this measures
+     * "open HTTP connection and get response headers". Use {@link #getObjectRead}
+     * for end-to-end comparison.
+     */
     @Benchmark
     public long getObject(Blackhole bh) {
         String k = nextKey();
+        try (InputStream is = client.getObject(bucket, k, 0, fileSizeBytes)) {
+            bh.consume(is);
+            return is.available();
+        } catch (Exception e) {
+            throw new RuntimeException("getObject failed: " + bucket + "/" + k, e);
+        }
+    }
+
+    /**
+     * Measures the full pipeline: getObject() + read loop — what the caller experiences.
+     *
+     * <p>Reads the entire file in 64KB chunks (matching Hadoop's RemoteObjectReader
+     * READ_BUFFER_SIZE = 64KB). This is the end-to-end cost for "get all bytes".
+     *
+     * <p>Read breakdown:
+     * <ul>
+     *   <li>JNI eager: getObject() loaded everything → read loop is just ByteArrayInputStream memory copy</li>
+     *   <li>Java SDK: getObject() opened HTTP stream → read loop pulls from socket in 64KB chunks</li>
+     * </ul>
+     */
+    @Benchmark
+    public long getObjectRead(Blackhole bh) {
+        String k = nextKey();
         long totalRead = 0;
         try (InputStream is = client.getObject(bucket, k, 0, fileSizeBytes)) {
-            byte[] buf = new byte[65536];  // 64KB read buffer
+            byte[] buf = new byte[65536];  // 64KB read buffer (matches Hadoop READ_BUFFER_SIZE)
             int n;
             while ((n = is.read(buf)) > 0) {
                 totalRead += n;
             }
         } catch (Exception e) {
-            throw new RuntimeException("getObject failed: " + bucket + "/" + k, e);
+            throw new RuntimeException("getObjectRead failed: " + bucket + "/" + k, e);
         }
         bh.consume(totalRead);
         return totalRead;
