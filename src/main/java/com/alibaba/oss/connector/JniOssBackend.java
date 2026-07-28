@@ -37,34 +37,26 @@ public class JniOssBackend implements OssBackend {
 
     @Override
     public InputStream getObject(String bucket, String key, long offset, long length) {
-        GetObjectRequest req = GetObjectRequest.builder()
-                .bucket(bucket)
-                .key(key)
-                .size(length)
-                .build();
-
-        try (GetObjectResult result = client.getObject(req)) {
-            OssObject obj = result.body();
-
-            // Seek to offset if needed
+        // Eager loading: read entire file into a single byte[].
+        // This matches the original behavior — passing the full remaining size
+        // to native read lets PhotonLibOS HTTP layer read in bulk.
+        // Improvement over original: uses readInto (GetPrimitiveArrayCritical)
+        // instead of read (GetByteArrayElements) for guaranteed zero-copy pin.
+        long objHandle = NativeBinding.getObject(client.handle(),
+                bucket, key, length, 0, null);
+        try (OssObject obj = new OssObject(objHandle)) {
             if (offset > 0) {
                 obj.seek(offset, 0); // SEEK_SET
             }
-
-            // Read all requested bytes into memory
-            // (For benchmarking simplicity; production would use streaming)
-            byte[] buf = new byte[(int) length];
+            byte[] result = new byte[(int) length];
             int totalRead = 0;
             while (totalRead < length) {
-                // OssObject.read(byte[], count) reads from current position
                 int remaining = (int) (length - totalRead);
-                byte[] tmp = new byte[remaining];
-                int n = obj.read(tmp, remaining);
+                int n = NativeBinding.readInto(obj.handle(), result, totalRead, remaining);
                 if (n <= 0) break;
-                System.arraycopy(tmp, 0, buf, totalRead, n);
                 totalRead += n;
             }
-            return new ByteArrayInputStream(buf, 0, totalRead);
+            return new ByteArrayInputStream(result);
         }
     }
 

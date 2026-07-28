@@ -66,6 +66,13 @@ class NativeBinding {
     /** Returns bytes read, throws on error. */
     static native int read(long obj, byte[] buf, int count);
 
+    /**
+     * Read directly into buf[offset..offset+length) using GetPrimitiveArrayCritical.
+     * Avoids intermediate copy compared to {@link #read}.
+     * Returns bytes read, throws on error.
+     */
+    static native int readInto(long obj, byte[] buf, int offset, int length);
+
     /** Returns bytes written, throws on error. */
     static native int write(long obj, byte[] data, int count);
 

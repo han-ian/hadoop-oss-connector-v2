@@ -23,6 +23,11 @@ public final class OssClient implements AutoCloseable {
 
     private long handle;
 
+    /** Package-private accessor for internal use (e.g. JniOssBackend). */
+    long handle() {
+        return handle;
+    }
+
     /**
      * Create a client with only an endpoint (uses default credential and config paths).
      */
