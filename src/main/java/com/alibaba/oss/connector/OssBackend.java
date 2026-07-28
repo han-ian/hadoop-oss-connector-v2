@@ -29,6 +29,22 @@ public interface OssBackend extends AutoCloseable {
     InputStream getObject(String bucket, String key, long offset, long length);
 
     /**
+     * Read a byte range directly into caller-provided buffer (zero-copy semantics).
+     *
+     * <p>This avoids the intermediate byte[] allocation that {@link #getObject} incurs
+     * on the JNI backend (which eager-loads into byte[]). It mirrors the pread(2)
+     * semantics used by Hadoop connector's CachingBlockManager.
+     *
+     * @param bucket bucket name
+     * @param key    object key
+     * @param buf    destination buffer
+     * @param offset start offset in the object (0-based)
+     * @param length number of bytes to read
+     * @return actual bytes read
+     */
+    int pread(String bucket, String key, byte[] buf, long offset, int length);
+
+    /**
      * Get object content length (HEAD request).
      *
      * @param bucket bucket name

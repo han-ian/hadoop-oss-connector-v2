@@ -68,6 +68,35 @@ public class JavaSdkOssBackend implements OssBackend {
     }
 
     @Override
+    public int pread(String bucket, String key, byte[] buf, long offset, int length) {
+        String range = "bytes=" + offset + "-" + (offset + length - 1);
+        try {
+            com.aliyun.sdk.service.oss2.models.GetObjectResult sdkResult = client.getObject(
+                    com.aliyun.sdk.service.oss2.models.GetObjectRequest.newBuilder()
+                            .bucket(bucket)
+                            .key(key)
+                            .range(range)
+                            .build(),
+                    com.aliyun.sdk.service.oss2.OperationOptions.defaults());
+            try (InputStream is = sdkResult.body()) {
+                int totalRead = 0;
+                while (totalRead < length) {
+                    int n = is.read(buf, totalRead, length - totalRead);
+                    if (n <= 0) break;
+                    totalRead += n;
+                }
+                if (totalRead != length) {
+                    throw new IllegalStateException("pread short read: " + bucket + "/" + key
+                            + " offset=" + offset + " length=" + length + " read=" + totalRead);
+                }
+                return totalRead;
+            }
+        } catch (Exception e) {
+            throw new RuntimeException("pread failed: " + bucket + "/" + key, e);
+        }
+    }
+
+    @Override
     public long headObject(String bucket, String key) {
         try {
             GetObjectMetaResult result = client.getObjectMeta(

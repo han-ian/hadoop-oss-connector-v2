@@ -37,13 +37,15 @@ public class JniOssBackend implements OssBackend {
 
     @Override
     public InputStream getObject(String bucket, String key, long offset, long length) {
-        // Eager loading: read entire file into a single byte[].
-        // This matches the original behavior — passing the full remaining size
-        // to native read lets PhotonLibOS HTTP layer read in bulk.
+        // Eager loading: read the requested range into a single byte[].
+        // NOTE: the native getObject `size` param declares the object's readable
+        // window [0, size) — it is set as ROSIZE on the underlying HTTP file.
+        // For a range read we must pass offset+length (not length!), otherwise
+        // seek(offset) lands beyond the declared size and pread returns 0 (EIO).
         // Improvement over original: uses readInto (GetPrimitiveArrayCritical)
         // instead of read (GetByteArrayElements) for guaranteed zero-copy pin.
         long objHandle = NativeBinding.getObject(client.handle(),
-                bucket, key, length, 0, null);
+                bucket, key, offset + length, 0, null);
         try (OssObject obj = new OssObject(objHandle)) {
             if (offset > 0) {
                 obj.seek(offset, 0); // SEEK_SET
@@ -56,7 +58,36 @@ public class JniOssBackend implements OssBackend {
                 if (n <= 0) break;
                 totalRead += n;
             }
+            if (totalRead != length) {
+                // Fail loudly — a short read here means wrong data, not EOF
+                throw new IllegalStateException("short read: " + bucket + "/" + key
+                        + " offset=" + offset + " length=" + length + " read=" + totalRead);
+            }
             return new ByteArrayInputStream(result);
+        }
+    }
+
+    @Override
+    public int pread(String bucket, String key, byte[] buf, long offset, int length) {
+        // Open object with size = offset + length (ROSIZE covers the read window)
+        long objHandle = NativeBinding.getObject(client.handle(),
+                bucket, key, offset + length, 0, null);
+        try (OssObject obj = new OssObject(objHandle)) {
+            if (offset > 0) {
+                obj.seek(offset, 0); // SEEK_SET
+            }
+            int totalRead = 0;
+            while (totalRead < length) {
+                int remaining = length - totalRead;
+                int n = NativeBinding.readInto(obj.handle(), buf, totalRead, remaining);
+                if (n <= 0) break;
+                totalRead += n;
+            }
+            if (totalRead != length) {
+                throw new IllegalStateException("pread short read: " + bucket + "/" + key
+                        + " offset=" + offset + " length=" + length + " read=" + totalRead);
+            }
+            return totalRead;
         }
     }
 
